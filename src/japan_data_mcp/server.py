@@ -14,6 +14,8 @@ from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from mcp.server.fastmcp import Context, FastMCP
+from starlette.requests import Request
+from starlette.responses import JSONResponse
 
 from japan_data_mcp.corp.client import CorpClient
 from japan_data_mcp.corp.models import CorpApiError, Corporation
@@ -153,6 +155,12 @@ mcp = FastMCP(
     json_response=True,
     stateless_http=True,
 )
+
+
+@mcp.custom_route("/health", methods=["GET"], include_in_schema=False)
+async def health_check(_: Request) -> JSONResponse:
+    """Return a lightweight health response for Sliplane."""
+    return JSONResponse({"status": "ok", "service": "japan-data-mcp-core"})
 
 
 # ------------------------------------------------------------------
