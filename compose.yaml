@@ -1,0 +1,28 @@
+services:
+  core:
+    build: .
+    environment:
+      ESTAT_APP_ID: ${ESTAT_APP_ID}
+      CORP_APP_ID: ${CORP_APP_ID:-}
+      REALESTATE_API_KEY: ${REALESTATE_API_KEY:-}
+      LISTINGS_JSON_URL: ${LISTINGS_JSON_URL:-}
+      LISTINGS_API_TOKEN: ${LISTINGS_API_TOKEN:-}
+      VACANT_CANDIDATES_URL: ${VACANT_CANDIDATES_URL:-}
+      VACANT_CANDIDATES_API_TOKEN: ${VACANT_CANDIDATES_API_TOKEN:-}
+      MCP_TOOL_PROFILE: ${MCP_TOOL_PROFILE:-curated}
+    expose:
+      - "8000"
+
+  gateway:
+    build:
+      context: .
+      dockerfile: gateway/Dockerfile
+    environment:
+      UPSTREAM_URL: http://core:8000
+      MCP_AUTH_TOKEN: ${MCP_AUTH_TOKEN}
+      MCP_AUTH_TOKEN_CLIENT_1: ${MCP_AUTH_TOKEN_CLIENT_1}
+      MCP_AUTH_TOKEN_CLIENT_2: ${MCP_AUTH_TOKEN_CLIENT_2}
+    ports:
+      - "8080:8080"
+    depends_on:
+      - core

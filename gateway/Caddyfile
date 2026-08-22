@@ -1,0 +1,30 @@
+:8080 {
+    log {
+        output stdout
+        format json
+    }
+
+    @health path /health
+    handle @health {
+        header Content-Type application/json
+        respond `{"status":"ok","service":"japan-data-mcp-gateway"}` 200
+    }
+
+    @mcp path /mcp /mcp/*
+    handle @mcp {
+        @authorized expression `{http.request.header.Authorization} == "Bearer {$MCP_AUTH_TOKEN}" || {http.request.header.Authorization} == "Bearer {$MCP_AUTH_TOKEN_CLIENT_1}" || {http.request.header.Authorization} == "Bearer {$MCP_AUTH_TOKEN_CLIENT_2}"`
+
+        handle @authorized {
+            reverse_proxy {$UPSTREAM_URL} {
+                flush_interval -1
+                header_up Host {upstream_hostport}
+            }
+        }
+
+        header Content-Type application/json
+        respond `{"error":"unauthorized"}` 401
+    }
+
+    header Content-Type application/json
+    respond `{"error":"not_found"}` 404
+}

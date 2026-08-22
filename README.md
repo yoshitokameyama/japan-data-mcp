@@ -25,6 +25,7 @@
 - **法人検索** — 法人名から企業の法人番号・所在地・種別を検索
 - **インボイス確認** — 会社名からインボイス登録番号を検索、登録状況・有効性を確認
 - **不動産取引価格** — 地域の不動産取引データと価格サマリーを取得
+- **土地の証拠分離** — 過去成約・現在の売出・空き地候補を別の証拠として返却
 - **データ検証** — 全ての出力にデータ出典・検証リンク・取得日時を付与
 
 ## 提供ツール一覧
@@ -62,6 +63,16 @@
 | ツール名 | 説明 |
 | --- | --- |
 | `get_real_estate_transactions` | 不動産取引価格情報を取得（価格サマリー付き） |
+| `search_real_estate_transactions` | 町名・市区町村コード・年から過去成約を証拠JSONで検索 |
+| `research_real_estate_area` | 過去成約・現在の売出・空き地候補を分離した統合調査 |
+| `search_plateau_datasets` | PLATEAU公式データカタログを検索 |
+| `get_mlit_geospatial_layers` | 地価・都市計画・用途地域・医療機関の代表レイヤーを座標検索 |
+| `get_connector_status` | 接続済み・未接続のデータ源を確認 |
+
+`research_real_estate_area` は現在の売出フィードや空間ETLが未接続の場合、
+過去成約から推測せず `not_configured` として明示します。すべての高水準結果は
+`data_as_of`、`retrieved_at`、`precision`、`confidence`、`sources`、
+`limitations` を含む共通の証拠エンベロープで返します。
 
 ## セットアップ
 
@@ -97,6 +108,8 @@ japan-data-mcp setup
 | `ESTAT_APP_ID` | e-Stat API | **必須** | [e-Stat API ガイド](https://www.e-stat.go.jp/api/api-info/api-guide) |
 | `CORP_APP_ID` | 法人番号 Web-API | 任意 | [法人番号公表サイト](https://www.houjin-bangou.nta.go.jp/webapi/)（発行まで2〜4週間） |
 | `REALESTATE_API_KEY` | 不動産情報ライブラリ API | 任意 | [不動産情報ライブラリ](https://www.reinfolib.mlit.go.jp/api/request/) |
+| `LISTINGS_JSON_URL` | 利用許諾済みの正規化済み売出フィード | 任意 | 契約先 |
+| `VACANT_CANDIDATES_URL` | 自社管理の空間ETLフィード | 任意 | 自社環境 |
 
 - **e-Stat API は必須** です。未設定の場合サーバーが起動しません。
 - 法人番号・不動産 API は任意です。未設定でも他の機能は正常に動作します。
@@ -194,6 +207,19 @@ search_invoice_by_name("トヨタ自動車", area="愛知県")
 ```
 get_real_estate_transactions("札幌市", year=2023)
 ```
+
+### 土地について証拠を分けて統合調査する
+
+```
+research_real_estate_area(
+    area_name="谷中",
+    city_code="13106",
+    target_area_sqm=100,
+    years=[2024, 2023]
+)
+```
+
+この結果だけで売出中・購入可能・建築可能とは判断しません。
 
 ### 地域の総合プロファイルを取得する
 

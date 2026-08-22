@@ -7,12 +7,20 @@ e-Stat API を使って日本の政府統計データにアクセスし、
 
 from __future__ import annotations
 
+import asyncio
+import json
 import logging
+import os
+import re
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from typing import Any
+from urllib.parse import urlsplit
 
+import httpx
 from mcp.server.fastmcp import Context, FastMCP
+from starlette.requests import Request
+from starlette.responses import JSONResponse
 
 from japan_data_mcp.corp.client import CorpClient
 from japan_data_mcp.corp.models import CorpApiError, Corporation
@@ -22,6 +30,20 @@ from japan_data_mcp.invoice.models import InvoiceApiError, InvoiceIssuer
 from japan_data_mcp.estat.formatter import StatsFormatter, build_source_footer
 from japan_data_mcp.presets.population import fetch_population
 from japan_data_mcp.presets.regional import fetch_regional_profile
+from japan_data_mcp.public_info.evidence import build_evidence_envelope
+from japan_data_mcp.public_info.mlit import (
+    REPRESENTATIVE_LAYERS,
+    ZOOM,
+    filter_geojson_features,
+    latlon_to_tile_fraction,
+    surrounding_tiles,
+)
+from japan_data_mcp.public_info.real_estate import (
+    calculate_price_stats,
+    filter_feed_items,
+    filter_transactions,
+    public_source_url,
+)
 from japan_data_mcp.realestate.client import RealEstateClient
 from japan_data_mcp.realestate.formatter import format_transactions
 from japan_data_mcp.realestate.models import RealEstateApiError
@@ -36,6 +58,38 @@ logger = logging.getLogger(__name__)
 
 _JST = timezone(timedelta(hours=9))
 
+_REINFOLIB_SOURCE = {
+    "name": "国土交通省 不動産情報ライブラリ（不動産取引価格情報）",
+    "url": "https://www.reinfolib.mlit.go.jp/help/apiManual/xit001/",
+}
+_PLATEAU_SOURCE = {
+    "name": "国土交通省 Project PLATEAU Data Catalog API",
+    "url": (
+        "https://docs.plateauview.mlit.go.jp/api/rest/operations/"
+        "datacatalogplateau-datasets/"
+    ),
+}
+_PLATEAU_DATASETS_URL = (
+    "https://api.plateauview.mlit.go.jp/datacatalog/plateau-datasets"
+)
+_REINFOLIB_EXTERNAL_BASE = "https://www.reinfolib.mlit.go.jp/ex-api/external"
+_REINFOLIB_API_MANUAL = "https://www.reinfolib.mlit.go.jp/help/apiManual/"
+
+_CURATED_TOOL_NAMES = {
+    "search_statistics",
+    "get_regional_data",
+    "compare_regions",
+    "resolve_area",
+    "list_available_stats",
+    "get_population",
+    "get_regional_profile",
+    "search_corporations",
+    "search_invoice_by_name",
+    "research_real_estate_area",
+    "get_mlit_geospatial_layers",
+    "get_connector_status",
+}
+
 
 # ------------------------------------------------------------------
 # Lifespan: EStatClient のライフサイクル管理
@@ -48,8 +102,11 @@ async def lifespan(server: FastMCP):  # noqa: ANN201
 
     e-Stat は必須。法人番号API・不動産APIはキー未設定時はスキップ。
     """
-    async with EStatClient() as estat_client:
+    async with EStatClient() as estat_client, httpx.AsyncClient(
+        timeout=20.0
+    ) as public_http_client:
         server._estat_client = estat_client  # type: ignore[attr-defined]
+        server._public_http_client = public_http_client  # type: ignore[attr-defined]
 
         # 法人番号API（オプション）
         corp_client: CorpClient | None = None
@@ -109,6 +166,10 @@ def _get_invoice_client(ctx: Context) -> InvoiceClient | None:
     return getattr(ctx.fastmcp, "_invoice_client", None)
 
 
+def _get_public_http_client(ctx: Context) -> httpx.AsyncClient:
+    return ctx.fastmcp._public_http_client  # type: ignore[attr-defined]
+
+
 # ------------------------------------------------------------------
 # サーバー初期化
 # ------------------------------------------------------------------
@@ -130,6 +191,12 @@ mcp = FastMCP(
         "- search_corporations: 法人名で企業を検索\n"
         "- get_corporation: 法人番号で企業情報を取得\n"
         "- get_real_estate_transactions: 不動産取引価格情報を取得\n"
+        "- research_real_estate_area: 成約・売出・空き地候補を分けて統合調査"
+        "（土地調査はまずこれを使う）\n"
+        "- search_real_estate_transactions: 出典付きJSONで過去成約を検索\n"
+        "- search_plateau_datasets: PLATEAU公開データセットを検索\n"
+        "- get_mlit_geospatial_layers: 地価・都市計画・用途地域等の代表レイヤー\n"
+        "- get_connector_status: 接続済み・未接続データ源を確認\n"
         "- search_invoice_by_name: 会社名からインボイス登録番号を検索"
         "（★インボイス確認はまずこれを使う）\n"
         "- check_invoice_registration: 登録番号（T+13桁）が既知の場合のみ使用\n"
@@ -146,7 +213,18 @@ mcp = FastMCP(
         "地域名は日本語で指定できます（例: 東京都、大阪府、福岡県）。"
     ),
     lifespan=lifespan,
+    host=os.environ.get("MCP_HOST", "127.0.0.1"),
+    port=int(os.environ.get("PORT", "8000")),
+    streamable_http_path=os.environ.get("MCP_PATH", "/mcp"),
+    json_response=True,
+    stateless_http=True,
 )
+
+
+@mcp.custom_route("/health", methods=["GET"], include_in_schema=False)
+async def health_check(_: Request) -> JSONResponse:
+    """Return a lightweight health response for container health checks."""
+    return JSONResponse({"status": "ok", "service": "japan-data-mcp-core"})
 
 
 # ------------------------------------------------------------------
@@ -604,6 +682,694 @@ async def get_real_estate_transactions(
         area_name=area_name,
         year=year,
         quarter=quarter,
+    )
+
+
+def _json_response(payload: dict[str, Any]) -> str:
+    return json.dumps(payload, ensure_ascii=False, indent=2)
+
+
+def _validated_city_code(city_code: str) -> tuple[str, str]:
+    if not re.fullmatch(r"\d{5}", city_code):
+        raise ValueError("city_codeは5桁の全国地方公共団体コードで指定してください。")
+    return city_code[:2], city_code
+
+
+def _normalize_years(years: list[int] | None) -> list[int]:
+    current_year = datetime.now(_JST).year
+    selected = years or [current_year - 1, current_year - 2]
+    selected = list(dict.fromkeys(selected))
+    if not 1 <= len(selected) <= 5:
+        raise ValueError("yearsは1〜5年を指定してください。")
+    if any(year < 2005 or year > current_year for year in selected):
+        raise ValueError(f"yearsは2005〜{current_year}の範囲で指定してください。")
+    return selected
+
+
+async def _transaction_evidence(
+    *,
+    area_name: str,
+    city_code: str,
+    years: list[int] | None,
+    land_only: bool,
+    target_area_sqm: float | None,
+    ctx: Context,
+) -> dict[str, Any]:
+    """Collect transaction evidence without treating it as current inventory."""
+    try:
+        pref_code, normalized_city_code = _validated_city_code(city_code)
+        selected_years = _normalize_years(years)
+    except ValueError as exc:
+        return build_evidence_envelope(
+            status="upstream_error",
+            data_as_of=None,
+            precision="transaction",
+            confidence="not_applicable",
+            sources=[_REINFOLIB_SOURCE],
+            limitations=[str(exc)],
+            data={"transactions": [], "errors": [str(exc)]},
+        )
+
+    re_client = _get_realestate_client(ctx)
+    if re_client is None:
+        return build_evidence_envelope(
+            status="not_configured",
+            data_as_of=None,
+            precision="transaction",
+            confidence="not_applicable",
+            sources=[_REINFOLIB_SOURCE],
+            limitations=[
+                "REALESTATE_API_KEYが未設定です。",
+                "過去成約であり、現在の売出在庫ではありません。",
+            ],
+            data={
+                "query": {
+                    "area_name": area_name,
+                    "city_code": normalized_city_code,
+                    "years": selected_years,
+                    "land_only": land_only,
+                },
+                "summary": calculate_price_stats([], target_area_sqm),
+                "transactions": [],
+                "errors": [],
+            },
+        )
+
+    await ctx.info(
+        f"不動産取引エビデンスを取得中: {area_name} ({', '.join(map(str, selected_years))})"
+    )
+    results = await asyncio.gather(
+        *(
+            re_client.get_transactions(
+                pref_code, city_code=normalized_city_code, year=year
+            )
+            for year in selected_years
+        ),
+        return_exceptions=True,
+    )
+    successful_years: list[int] = []
+    errors: list[str] = []
+    transactions = []
+    for year, result in zip(selected_years, results, strict=True):
+        if isinstance(result, BaseException):
+            if isinstance(result, RealEstateApiError):
+                errors.append(f"{year}: {result.message}")
+            else:
+                errors.append(f"{year}: upstream request failed")
+            continue
+        successful_years.append(year)
+        transactions.extend(result)
+
+    normalized = filter_transactions(
+        transactions, area_name=area_name, land_only=land_only
+    )
+    if errors and not successful_years:
+        status = "upstream_error"
+    elif errors:
+        status = "partial"
+    elif not normalized:
+        status = "no_results"
+    else:
+        status = "ok"
+
+    return build_evidence_envelope(
+        status=status,
+        data_as_of=str(max(successful_years)) if successful_years else None,
+        precision="transaction",
+        confidence=(
+            "high" if len(normalized) >= 5 else "medium" if normalized else "low"
+        ),
+        sources=[_REINFOLIB_SOURCE],
+        limitations=[
+            "これは過去の成約事例であり、現在売り出されている物件ではありません。",
+            "公開データでは所在地や面積等が丸められる場合があります。",
+            "価格推定は成約単価の中央値による単純計算で、査定ではありません。",
+        ],
+        data={
+            "query": {
+                "area_name": area_name,
+                "city_code": normalized_city_code,
+                "years": selected_years,
+                "land_only": land_only,
+            },
+            "summary": calculate_price_stats(normalized, target_area_sqm),
+            "transactions": normalized[:20],
+            "total_matches": len(normalized),
+            "errors": errors,
+        },
+    )
+
+
+async def _optional_feed_evidence(
+    *,
+    kind: str,
+    area_name: str,
+    target_area_sqm: float | None,
+    ctx: Context,
+) -> dict[str, Any]:
+    """Read an optional licensed listing or spatial-ETL normalized feed."""
+    if kind == "listing":
+        url = os.environ.get("LISTINGS_JSON_URL", "")
+        token = os.environ.get("LISTINGS_API_TOKEN", "")
+        item_key = "listings"
+        fallback_source = "https://data-solution.homes.jp/"
+        missing = (
+            "現在の売出フィードが未接続です。公開取引データから売出中とは推測しません。"
+        )
+        configured_limit = (
+            "掲載中でも申込済み・成約済みの場合があります。仲介会社への確認が必要です。"
+        )
+        precision = "listing"
+    else:
+        url = os.environ.get("VACANT_CANDIDATES_URL", "")
+        token = os.environ.get("VACANT_CANDIDATES_API_TOKEN", "")
+        item_key = "candidates"
+        fallback_source = _PLATEAU_SOURCE["url"]
+        missing = (
+            "地番・建物・土地利用等を統合する空間ETLが未接続です。"
+        )
+        configured_limit = (
+            "候補判定であり、所有者・売却意思・建築可能性を保証しません。"
+        )
+        precision = "candidate"
+
+    if not url:
+        return build_evidence_envelope(
+            status="not_configured",
+            data_as_of=None,
+            precision=precision,  # type: ignore[arg-type]
+            confidence="not_applicable",
+            sources=[],
+            limitations=[missing],
+            data={item_key: [], "total_matches": 0},
+        )
+
+    parsed = urlsplit(url)
+    if parsed.scheme != "https" and parsed.hostname not in {"127.0.0.1", "localhost"}:
+        return build_evidence_envelope(
+            status="upstream_error",
+            data_as_of=None,
+            precision=precision,  # type: ignore[arg-type]
+            confidence="not_applicable",
+            sources=[],
+            limitations=["正規フィードURLはHTTPSで設定してください。"],
+            data={item_key: [], "total_matches": 0},
+        )
+
+    try:
+        response = await _get_public_http_client(ctx).get(
+            url,
+            headers={"Authorization": f"Bearer {token}"} if token else {},
+        )
+        response.raise_for_status()
+        payload = response.json()
+        if not isinstance(payload, dict):
+            raise ValueError("normalized feed must return a JSON object")
+        raw_items = payload.get("items", [])
+        if not isinstance(raw_items, list):
+            raise ValueError("normalized feed items must be an array")
+        min_area = target_area_sqm * 0.8 if target_area_sqm else None
+        max_area = target_area_sqm * 1.2 if target_area_sqm else None
+        matches = filter_feed_items(
+            [item for item in raw_items if isinstance(item, dict)],
+            area_name=area_name,
+            min_area_sqm=min_area,
+            max_area_sqm=max_area,
+        )
+    except (httpx.HTTPError, ValueError):
+        return build_evidence_envelope(
+            status="upstream_error",
+            data_as_of=None,
+            precision=precision,  # type: ignore[arg-type]
+            confidence="not_applicable",
+            sources=[],
+            limitations=["正規フィードの取得または形式検証に失敗しました。"],
+            data={item_key: [], "total_matches": 0},
+        )
+
+    source = {
+        "name": str(payload.get("source") or "Authorized normalized feed"),
+        "url": public_source_url(payload.get("source_url"), fallback_source),
+    }
+    return build_evidence_envelope(
+        status="ok" if matches else "no_results",
+        data_as_of=(
+            str(payload["data_as_of"]) if payload.get("data_as_of") else None
+        ),
+        precision=precision,  # type: ignore[arg-type]
+        confidence="high" if kind == "listing" else "medium",
+        sources=[source],
+        limitations=[configured_limit],
+        data={item_key: matches[:20], "total_matches": len(matches)},
+    )
+
+
+@mcp.tool()
+async def search_real_estate_transactions(
+    area_name: str,
+    city_code: str,
+    ctx: Context,
+    years: list[int] | None = None,
+    land_only: bool = True,
+) -> str:
+    """町名・市区町村コード・年から過去の成約事例を出典付きJSONで検索する.
+
+    現在の売出物件を探す用途には使わない。土地調査全体には
+    research_real_estate_areaを優先する。
+    """
+    return _json_response(
+        await _transaction_evidence(
+            area_name=area_name,
+            city_code=city_code,
+            years=years,
+            land_only=land_only,
+            target_area_sqm=None,
+            ctx=ctx,
+        )
+    )
+
+
+@mcp.tool()
+async def get_connector_status(ctx: Context) -> str:
+    """公開情報データ源の接続状態と、未接続のため回答できない領域を返す."""
+    del ctx
+    return _json_response(
+        build_evidence_envelope(
+            status="ok",
+            data_as_of=None,
+            precision="dataset",
+            confidence="not_applicable",
+            sources=[],
+            limitations=[
+                "configuredは環境変数の存在確認であり、上流APIの疎通成功を保証しません。"
+            ],
+            data={
+                "service": "japan-public-info-mcp",
+                "read_only": True,
+                "tool_profile": os.environ.get("MCP_TOOL_PROFILE", "full"),
+                "visible_tool_count": len(mcp._tool_manager._tools),
+                "connectors": {
+                    "estat": {"configured": bool(os.environ.get("ESTAT_APP_ID"))},
+                    "corporations_and_invoice": {
+                        "configured": bool(os.environ.get("CORP_APP_ID"))
+                    },
+                    "transaction_prices": {
+                        "configured": bool(os.environ.get("REALESTATE_API_KEY")),
+                        "source": _REINFOLIB_SOURCE,
+                    },
+                    "plateau_catalog": {
+                        "configured": True,
+                        "source": _PLATEAU_SOURCE,
+                    },
+                    "current_listings": {
+                        "configured": bool(os.environ.get("LISTINGS_JSON_URL")),
+                        "requires": "authorized normalized feed",
+                    },
+                    "vacant_land_candidates": {
+                        "configured": bool(
+                            os.environ.get("VACANT_CANDIDATES_URL")
+                        ),
+                        "requires": "parcel/building/land-use spatial ETL",
+                    },
+                    "owners": {
+                        "configured": False,
+                        "reason": "Phase 1の公開tool契約には含めない",
+                    },
+                },
+            },
+        )
+    )
+
+
+@mcp.tool()
+async def search_plateau_datasets(
+    ctx: Context,
+    city_code: str | None = None,
+    dataset_type: str | None = None,
+    year: int | None = None,
+) -> str:
+    """自治体コード・データ種別・年度でPLATEAU公式カタログを検索する.
+
+    データセットの存在確認用であり、空き地や売却可否を直接判定しない。
+    """
+    try:
+        response = await _get_public_http_client(ctx).get(_PLATEAU_DATASETS_URL)
+        response.raise_for_status()
+        payload = response.json()
+        if isinstance(payload, list):
+            datasets = payload
+        elif isinstance(payload, dict):
+            datasets = next(
+                (
+                    payload[key]
+                    for key in ("data", "datasets", "results")
+                    if isinstance(payload.get(key), list)
+                ),
+                [],
+            )
+        else:
+            datasets = []
+    except (httpx.HTTPError, ValueError):
+        return _json_response(
+            build_evidence_envelope(
+                status="upstream_error",
+                data_as_of=None,
+                precision="dataset",
+                confidence="not_applicable",
+                sources=[_PLATEAU_SOURCE],
+                limitations=["PLATEAU公式カタログの取得に失敗しました。"],
+                data={"count": 0, "datasets": []},
+            )
+        )
+
+    matches: list[dict[str, Any]] = []
+    for raw in datasets:
+        if not isinstance(raw, dict):
+            continue
+        raw_city = str(raw.get("city_code") or raw.get("cityCode") or "")
+        raw_type = str(raw.get("type_en") or raw.get("type") or "").lower()
+        raw_year = raw.get("year") or raw.get("fiscal_year")
+        if city_code and raw_city != city_code:
+            continue
+        if dataset_type and dataset_type.lower() not in raw_type:
+            continue
+        if year is not None and str(raw_year) != str(year):
+            continue
+        matches.append(raw)
+
+    return _json_response(
+        build_evidence_envelope(
+            status="ok" if matches else "no_results",
+            data_as_of=datetime.now(_JST).date().isoformat(),
+            precision="dataset",
+            confidence="high",
+            sources=[_PLATEAU_SOURCE],
+            limitations=[
+                "データセットの存在を示すもので、空き地や売却可否を直接判定しません。"
+            ],
+            data={"count": len(matches), "datasets": matches[:100]},
+        )
+    )
+
+
+async def _fetch_mlit_layer(
+    *,
+    api_number: int,
+    lat: float,
+    lon: float,
+    distance_m: float,
+    year: int | None,
+    api_key: str,
+    ctx: Context,
+) -> dict[str, Any]:
+    layer = REPRESENTATIVE_LAYERS[api_number]
+    x, y, x_fraction, y_fraction = latlon_to_tile_fraction(lat, lon)
+    tiles = (
+        surrounding_tiles(x, y, x_fraction, y_fraction)
+        if layer["geometry"] == "point"
+        else [(x, y)]
+    )
+    requests = []
+    for tile_x, tile_y in tiles:
+        params: dict[str, Any] = {
+            "response_format": "geojson",
+            "z": ZOOM,
+            "x": tile_x,
+            "y": tile_y,
+        }
+        if api_number == 3 and year is not None:
+            params["year"] = year
+        requests.append(
+            _get_public_http_client(ctx).get(
+                f"{_REINFOLIB_EXTERNAL_BASE}/{layer['endpoint']}",
+                params=params,
+                headers={
+                    "Ocp-Apim-Subscription-Key": api_key,
+                    "Accept": "application/geo+json, application/json",
+                },
+            )
+        )
+
+    responses = await asyncio.gather(*requests, return_exceptions=True)
+    raw_features: list[dict[str, Any]] = []
+    errors: list[str] = []
+    for response in responses:
+        if isinstance(response, BaseException):
+            errors.append("upstream request failed")
+            continue
+        try:
+            response.raise_for_status()
+            payload = response.json()
+        except (httpx.HTTPError, ValueError):
+            errors.append("upstream response failed validation")
+            continue
+        if isinstance(payload, dict) and isinstance(payload.get("features"), list):
+            raw_features.extend(
+                feature
+                for feature in payload["features"]
+                if isinstance(feature, dict)
+            )
+
+    matches = filter_geojson_features(
+        raw_features,
+        geometry_mode=layer["geometry"],
+        lat=lat,
+        lon=lon,
+        distance_m=distance_m,
+    )
+    status = (
+        "partial"
+        if errors and matches
+        else "upstream_error"
+        if errors and not raw_features
+        else "ok"
+        if matches
+        else "no_results"
+    )
+    return {
+        "api_number": api_number,
+        "name": layer["name"],
+        "use": layer["use"],
+        "endpoint": layer["endpoint"],
+        "status": status,
+        "count": len(matches),
+        "features": matches[:100],
+        "errors": errors,
+    }
+
+
+@mcp.tool()
+async def get_mlit_geospatial_layers(
+    lat: float,
+    lon: float,
+    target_apis: list[int],
+    ctx: Context,
+    distance: float = 425.0,
+    year: int | None = None,
+) -> str:
+    """指定地点の国交省代表レイヤーを取得する段階移植adapter.
+
+    既存get_multi_apiと同じlat・lon・target_apis・distance・yearを受ける。
+    Phase 1対応APIは3（地価）、4（都市計画区域）、5（用途地域）、
+    11（医療機関）。一度に4種類までの読み取り専用取得に限定する。
+    """
+    api_key = os.environ.get("REALESTATE_API_KEY", "")
+    try:
+        if not -90 <= lat <= 90 or not -180 <= lon <= 180:
+            raise ValueError("緯度・経度が範囲外です。")
+        if not 0 <= distance <= 425:
+            raise ValueError("distanceは0〜425mで指定してください。")
+        selected = list(dict.fromkeys(target_apis))
+        if not selected or len(selected) > 4:
+            raise ValueError("target_apisは1〜4個指定してください。")
+        unsupported = sorted(set(selected) - set(REPRESENTATIVE_LAYERS))
+        if unsupported:
+            raise ValueError(
+                f"Phase 1未対応のAPI番号です: {unsupported}。対応: {sorted(REPRESENTATIVE_LAYERS)}"
+            )
+        if year is not None and not 1995 <= year <= datetime.now(_JST).year:
+            raise ValueError("yearは1995年から現在年までで指定してください。")
+    except ValueError as exc:
+        return _json_response(
+            build_evidence_envelope(
+                status="upstream_error",
+                data_as_of=None,
+                precision="area",
+                confidence="not_applicable",
+                sources=[{"name": "国土交通省 不動産情報ライブラリ", "url": _REINFOLIB_API_MANUAL}],
+                limitations=[str(exc)],
+                data={"layers": [], "errors": [str(exc)]},
+            )
+        )
+
+    if not api_key:
+        return _json_response(
+            build_evidence_envelope(
+                status="not_configured",
+                data_as_of=None,
+                precision="area",
+                confidence="not_applicable",
+                sources=[{"name": "国土交通省 不動産情報ライブラリ", "url": _REINFOLIB_API_MANUAL}],
+                limitations=["REALESTATE_API_KEYが未設定です。"],
+                data={
+                    "query": {"lat": lat, "lon": lon, "target_apis": selected},
+                    "layers": [],
+                },
+            )
+        )
+
+    await ctx.info(f"国交省代表レイヤーを取得中: API {selected}")
+    layers = await asyncio.gather(
+        *(
+            _fetch_mlit_layer(
+                api_number=api_number,
+                lat=lat,
+                lon=lon,
+                distance_m=distance,
+                year=year,
+                api_key=api_key,
+                ctx=ctx,
+            )
+            for api_number in selected
+        )
+    )
+    statuses = [layer["status"] for layer in layers]
+    status = (
+        "ok"
+        if all(value in {"ok", "no_results"} for value in statuses)
+        else "upstream_error"
+        if all(value == "upstream_error" for value in statuses)
+        else "partial"
+    )
+    sources = [
+        {
+            "name": "国土交通省 不動産情報ライブラリ",
+            "url": _REINFOLIB_API_MANUAL,
+            "document_id": f"API {api_number}: {REPRESENTATIVE_LAYERS[api_number]['endpoint']}",
+            "query": f"z={ZOOM}, lat/lon, distance={distance}, year={year}",
+        }
+        for api_number in selected
+    ]
+    return _json_response(
+        build_evidence_envelope(
+            status=status,  # type: ignore[arg-type]
+            data_as_of=str(year) if year is not None and 3 in selected else None,
+            precision="area",
+            confidence="high" if status == "ok" else "medium" if status == "partial" else "low",
+            sources=sources,
+            limitations=[
+                "Phase 1は代表4 APIのみの段階移植です。旧get_multi_apiの全30 API互換ではありません。",
+                "地価は周辺点、都市計画・用途地域は指定点との交差、医療機関は半径内の結果です。",
+                "公式原データの属性定義を確認して最終判断してください。",
+            ],
+            data={
+                "query": {
+                    "lat": lat,
+                    "lon": lon,
+                    "target_apis": selected,
+                    "distance": distance,
+                    "year": year,
+                },
+                "supported_api_numbers": sorted(REPRESENTATIVE_LAYERS),
+                "layers": layers,
+            },
+        )
+    )
+
+
+@mcp.tool()
+async def research_real_estate_area(
+    area_name: str,
+    city_code: str,
+    ctx: Context,
+    target_area_sqm: float | None = None,
+    years: list[int] | None = None,
+) -> str:
+    """地域の土地について過去成約・現在の売出・空き地候補を分離して調査する.
+
+    土地価格や購入可能性を質問された場合の標準入口。未接続の証拠層は
+    推測で補わずnot_configuredとして返す。
+    """
+    transactions, listings, candidates = await asyncio.gather(
+        _transaction_evidence(
+            area_name=area_name,
+            city_code=city_code,
+            years=years,
+            land_only=True,
+            target_area_sqm=target_area_sqm,
+            ctx=ctx,
+        ),
+        _optional_feed_evidence(
+            kind="listing",
+            area_name=area_name,
+            target_area_sqm=target_area_sqm,
+            ctx=ctx,
+        ),
+        _optional_feed_evidence(
+            kind="candidate",
+            area_name=area_name,
+            target_area_sqm=target_area_sqm,
+            ctx=ctx,
+        ),
+    )
+    layers = [transactions, listings, candidates]
+    layer_statuses = [layer["status"] for layer in layers]
+    if all(status == "ok" for status in layer_statuses):
+        status = "ok"
+    elif all(status == "not_configured" for status in layer_statuses):
+        status = "not_configured"
+    elif all(status in {"upstream_error", "not_configured"} for status in layer_statuses):
+        status = "upstream_error"
+    else:
+        status = "partial"
+
+    sources: list[dict[str, Any]] = []
+    seen_urls: set[str] = set()
+    for layer in layers:
+        for source in layer["sources"]:
+            if source.get("url") not in seen_urls:
+                sources.append(source)
+                seen_urls.add(str(source.get("url")))
+
+    transaction_count = transactions["data"].get("total_matches", 0)
+    unknowns = []
+    if listings["status"] == "not_configured":
+        unknowns.append("現在売り出されている土地の有無")
+    if candidates["status"] == "not_configured":
+        unknowns.append("建物が見当たらない土地候補の有無")
+    unknowns.extend(["所有者", "売却意思", "権利関係", "建築可能性"])
+
+    return _json_response(
+        build_evidence_envelope(
+            status=status,  # type: ignore[arg-type]
+            data_as_of=transactions["data_as_of"],
+            precision="area",
+            confidence=(
+                "medium" if transaction_count >= 5 else "low"
+            ),
+            sources=sources,
+            limitations=[
+                "過去成約、現在の売出、物理的な空き地候補は別々の証拠です。",
+                "購入可能性と価格は現地・仲介・法務確認なしに確定できません。",
+            ],
+            data={
+                "query": {
+                    "area_name": area_name,
+                    "city_code": city_code,
+                    "target_area_sqm": target_area_sqm,
+                    "years": years,
+                },
+                "transactions": transactions,
+                "current_listings": listings,
+                "vacant_candidates": candidates,
+                "unknowns": unknowns,
+                "next_actions": [
+                    "正規の売出フィードまたは仲介会社で現在の掲載状況を確認する",
+                    "用途地域・接道・建築制限を公式資料で確認する",
+                    "候補地は現地確認と権利調査を行う",
+                ],
+            },
+        )
     )
 
 
@@ -1118,9 +1884,27 @@ def _get_area_display_name(area: str, area_code: str) -> str:
 # ------------------------------------------------------------------
 
 
+def _apply_tool_profile() -> None:
+    """Expose a curated catalog to AI clients while retaining a full admin mode."""
+    profile = os.environ.get("MCP_TOOL_PROFILE", "full").lower()
+    if profile == "full":
+        return
+    if profile != "curated":
+        raise ValueError("MCP_TOOL_PROFILE must be 'full' or 'curated'")
+    for tool_name in list(mcp._tool_manager._tools):
+        if tool_name not in _CURATED_TOOL_NAMES:
+            mcp.remove_tool(tool_name)
+
+
+_apply_tool_profile()
+
+
 def main() -> None:
     """MCP サーバーを起動する."""
-    mcp.run()
+    transport = os.environ.get("MCP_TRANSPORT", "stdio")
+    if transport not in {"stdio", "sse", "streamable-http"}:
+        raise ValueError(f"Unsupported MCP_TRANSPORT: {transport}")
+    mcp.run(transport=transport)  # type: ignore[arg-type]
 
 
 if __name__ == "__main__":
