@@ -15,4 +15,4 @@ RUN pip install --no-cache-dir .
 
 EXPOSE 8000
 
-CMD ["japan-data-mcp"]
+CMD ["python", "-m", "japan_data_mcp.server"]
