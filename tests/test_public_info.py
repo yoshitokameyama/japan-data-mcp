@@ -9,6 +9,7 @@ from japan_data_mcp.public_info.evidence import build_evidence_envelope
 from japan_data_mcp.public_info.real_estate import (
     calculate_price_stats,
     filter_feed_items,
+    filter_transactions,
     public_source_url,
 )
 from japan_data_mcp.public_info.project_links import parse_project_links_listings
@@ -134,6 +135,21 @@ def test_feed_filter_and_public_url_do_not_leak_query_secrets():
         )
         == "https://example.test/feed"
     )
+
+
+def test_transaction_filter_supports_municipality_and_neighbourhood_queries():
+    municipality_matches = filter_transactions(
+        _transactions(), area_name="東京都台東区", land_only=True
+    )
+    neighbourhood_matches = filter_transactions(
+        _transactions(), area_name="谷中", land_only=True
+    )
+
+    assert {item["district_name"] for item in municipality_matches} == {
+        "谷中",
+        "上野桜木",
+    }
+    assert [item["district_name"] for item in neighbourhood_matches] == ["谷中"]
 
 
 async def test_transaction_search_returns_only_land_and_evidence_fields():

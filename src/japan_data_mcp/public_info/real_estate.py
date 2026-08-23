@@ -69,11 +69,21 @@ def filter_transactions(
     area_name: str,
     land_only: bool,
 ) -> list[dict[str, Any]]:
-    """Filter by district name and normalize without inferring missing facts."""
+    """Filter by municipality/address text and normalize without inference.
+
+    The upstream API is already scoped by municipality code.  The additional
+    text filter supports both municipality-level queries (``東京都台東区``)
+    and neighbourhood queries (``谷中``).  Matching only ``DistrictName``
+    incorrectly discarded every record for municipality-level searches.
+    """
     query = normalized_text(area_name)
     matches: list[dict[str, Any]] = []
     for transaction in transactions:
-        if query and query not in normalized_text(transaction.district_name):
+        searchable_area = normalized_text(
+            f"{transaction.prefecture}{transaction.municipality}"
+            f"{transaction.district_name}"
+        )
+        if query and query not in searchable_area:
             continue
         if land_only and not is_land_transaction(transaction):
             continue
