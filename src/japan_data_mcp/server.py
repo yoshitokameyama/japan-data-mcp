@@ -8,11 +8,14 @@ e-Stat API を使って日本の政府統計データにアクセスし、
 from __future__ import annotations
 
 import logging
+import os
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from mcp.server.fastmcp import Context, FastMCP
+from starlette.requests import Request
+from starlette.responses import JSONResponse
 
 from japan_data_mcp.corp.client import CorpClient
 from japan_data_mcp.corp.models import CorpApiError, Corporation
@@ -146,7 +149,18 @@ mcp = FastMCP(
         "地域名は日本語で指定できます（例: 東京都、大阪府、福岡県）。"
     ),
     lifespan=lifespan,
+    host=os.environ.get("MCP_HOST", "127.0.0.1"),
+    port=int(os.environ.get("PORT", "8000")),
+    streamable_http_path=os.environ.get("MCP_PATH", "/mcp"),
+    json_response=True,
+    stateless_http=True,
 )
+
+
+@mcp.custom_route("/health", methods=["GET"], include_in_schema=False)
+async def health_check(_: Request) -> JSONResponse:
+    """Return a lightweight health response for Sliplane."""
+    return JSONResponse({"status": "ok", "service": "japan-data-mcp-core"})
 
 
 # ------------------------------------------------------------------
@@ -1120,7 +1134,10 @@ def _get_area_display_name(area: str, area_code: str) -> str:
 
 def main() -> None:
     """MCP サーバーを起動する."""
-    mcp.run()
+    transport = os.environ.get("MCP_TRANSPORT", "stdio")
+    if transport not in {"stdio", "sse", "streamable-http"}:
+        raise ValueError(f"Unsupported MCP_TRANSPORT: {transport}")
+    mcp.run(transport=transport)  # type: ignore[arg-type]
 
 
 if __name__ == "__main__":
