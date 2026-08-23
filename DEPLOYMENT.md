@@ -1,4 +1,4 @@
-# Container deployment
+# Sliplane deployment
 
 This fork supports a two-service deployment:
 
@@ -7,7 +7,7 @@ This fork supports a two-service deployment:
 
 The gateway exposes `/health` without authentication and requires a Bearer
 token for `/mcp`. Keep the core service private and configure the gateway's
-`UPSTREAM_URL` with the container platform's internal endpoint.
+`UPSTREAM_URL` with the core service's Sliplane internal endpoint.
 
 ## Core environment variables
 
@@ -27,9 +27,17 @@ token for `/mcp`. Keep the core service private and configure the gateway's
 - `MCP_AUTH_TOKEN`
 - `MCP_AUTH_TOKEN_CLIENT_1`
 - `MCP_AUTH_TOKEN_CLIENT_2`
+- `MCP_AUTH_TOKEN_CODEX`
+- `MCP_AUTH_TOKEN_NOTION`
+- `MCP_AUTH_TOKEN_KAMEYAMA_HOME` (migration compatibility)
+- `MCP_AUTH_TOKEN_WIFE_HOME` (migration compatibility)
 
-Store every real credential in the deployment platform's secret store. Do not create
+Store every real credential in Sliplane environment variables. Do not create
 or commit a production `.env` file.
+
+Do not remove the two migration-compatibility token names until every existing
+client has been inventoried and moved. Their values remain Sliplane secrets and
+must never be copied into this repository or Notion.
 
 Use `MCP_TOOL_PROFILE=full` only for migration/admin clients that require the
 legacy and advanced tools. The curated profile reduces overlapping choices for

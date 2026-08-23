@@ -12,7 +12,7 @@
 
     @mcp path /mcp /mcp/*
     handle @mcp {
-        @authorized expression `{http.request.header.Authorization} == "Bearer {$MCP_AUTH_TOKEN}" || {http.request.header.Authorization} == "Bearer {$MCP_AUTH_TOKEN_CLIENT_1}" || {http.request.header.Authorization} == "Bearer {$MCP_AUTH_TOKEN_CLIENT_2}"`
+        @authorized expression `{http.request.header.Authorization} == "Bearer {$MCP_AUTH_TOKEN}" || {http.request.header.Authorization} == "Bearer {$MCP_AUTH_TOKEN_CLIENT_1}" || {http.request.header.Authorization} == "Bearer {$MCP_AUTH_TOKEN_CLIENT_2}" || {http.request.header.Authorization} == "Bearer {$MCP_AUTH_TOKEN_CODEX}" || {http.request.header.Authorization} == "Bearer {$MCP_AUTH_TOKEN_NOTION}" || {http.request.header.Authorization} == "Bearer {$MCP_AUTH_TOKEN_KAMEYAMA_HOME}" || {http.request.header.Authorization} == "Bearer {$MCP_AUTH_TOKEN_WIFE_HOME}"`
 
         handle @authorized {
             reverse_proxy {$UPSTREAM_URL} {
