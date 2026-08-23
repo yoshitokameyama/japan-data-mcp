@@ -27,6 +27,6 @@ services:
       MCP_AUTH_TOKEN_KAMEYAMA_HOME: ${MCP_AUTH_TOKEN_KAMEYAMA_HOME}
       MCP_AUTH_TOKEN_WIFE_HOME: ${MCP_AUTH_TOKEN_WIFE_HOME}
     ports:
-      - "8080:8080"
+      - "8080:80"
     depends_on:
       - core

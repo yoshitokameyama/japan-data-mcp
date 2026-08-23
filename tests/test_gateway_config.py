@@ -9,6 +9,7 @@ CADDYFILE = Path(__file__).parents[1] / "gateway" / "Caddyfile"
 def test_gateway_health_is_public_but_mcp_has_401_fallback():
     config = CADDYFILE.read_text(encoding="utf-8")
 
+    assert config.startswith(":80 {")
     assert "@health path /health" in config
     assert 'respond `{"status":"ok","service":"japan-data-mcp-gateway"}` 200' in config
     assert "@mcp path /mcp /mcp/*" in config
