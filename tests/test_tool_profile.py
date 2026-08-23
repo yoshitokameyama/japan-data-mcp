@@ -8,7 +8,7 @@ import subprocess
 import sys
 
 
-def test_curated_profile_exposes_twelve_non_overlapping_tools():
+def test_curated_profile_exposes_thirteen_non_overlapping_tools():
     environment = dict(os.environ)
     environment["MCP_TOOL_PROFILE"] = "curated"
     result = subprocess.run(
@@ -27,9 +27,10 @@ def test_curated_profile_exposes_twelve_non_overlapping_tools():
     )
     tools = json.loads(result.stdout)
 
-    assert len(tools) == 12
+    assert len(tools) == 13
     assert "research_real_estate_area" in tools
     assert "get_mlit_geospatial_layers" in tools
     assert "get_connector_status" in tools
+    assert "search_government_open_data" in tools
     assert "get_real_estate_transactions" not in tools
     assert "search_real_estate_transactions" not in tools

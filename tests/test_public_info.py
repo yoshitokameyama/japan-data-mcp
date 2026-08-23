@@ -11,11 +11,13 @@ from japan_data_mcp.public_info.real_estate import (
     filter_feed_items,
     public_source_url,
 )
+from japan_data_mcp.public_info.project_links import parse_project_links_listings
 from japan_data_mcp.realestate.models import Transaction
 from japan_data_mcp.server import (
     get_connector_status,
     research_real_estate_area,
     search_plateau_datasets,
+    search_government_open_data,
     search_real_estate_transactions,
 )
 
@@ -153,11 +155,18 @@ async def test_integrated_research_keeps_evidence_layers_separate(monkeypatch):
     monkeypatch.delenv("LISTINGS_JSON_URL", raising=False)
     monkeypatch.delenv("VACANT_CANDIDATES_URL", raising=False)
 
+    response = MagicMock()
+    response.raise_for_status = MagicMock()
+    response.content = (
+        "PROPERTY_NUMBER_ID,PROPERTY_CATEGORY,PREFECTURE,CITY,AMOUNT/RENT,SIZE_OF_LOT\n"
+        "1,売買土地,東京都,台東区,30000000,100\n"
+    ).encode()
+    ctx = _ctx(transactions=_transactions())
+    ctx.fastmcp._public_http_client.get = AsyncMock(return_value=response)
+
     result = json.loads(
         await research_real_estate_area(
-            "谷中",
-            "13106",
-            _ctx(transactions=_transactions()),
+            "谷中", "13106", ctx,
             target_area_sqm=100,
             years=[2024],
         )
@@ -166,9 +175,10 @@ async def test_integrated_research_keeps_evidence_layers_separate(monkeypatch):
     assert result["status"] == "partial"
     assert result["precision"] == "area"
     assert result["data"]["transactions"]["status"] == "ok"
-    assert result["data"]["current_listings"]["status"] == "not_configured"
+    assert result["data"]["current_listings"]["status"] == "ok"
+    assert result["data"]["current_listings"]["precision"] == "municipality"
     assert result["data"]["vacant_candidates"]["status"] == "not_configured"
-    assert "現在売り出されている土地の有無" in result["data"]["unknowns"]
+    assert "2025年3月31日以降の掲載継続状況" in result["data"]["unknowns"]
     assert "所有者" in result["data"]["unknowns"]
 
 
@@ -178,21 +188,23 @@ async def test_integrated_research_reports_all_missing_connectors_as_not_configu
     monkeypatch.delenv("LISTINGS_JSON_URL", raising=False)
     monkeypatch.delenv("VACANT_CANDIDATES_URL", raising=False)
 
+    response = MagicMock()
+    response.raise_for_status = MagicMock(side_effect=Exception("unavailable"))
+    ctx = _ctx(transactions=None)
+    ctx.fastmcp._public_http_client.get = AsyncMock(side_effect=ValueError("unavailable"))
     result = json.loads(
         await research_real_estate_area(
-            "谷中",
-            "13106",
-            _ctx(transactions=None),
+            "谷中", "13106", ctx,
             target_area_sqm=100,
         )
     )
 
-    assert result["status"] == "not_configured"
+    assert result["status"] == "upstream_error"
     assert {
         result["data"]["transactions"]["status"],
         result["data"]["current_listings"]["status"],
         result["data"]["vacant_candidates"]["status"],
-    } == {"not_configured"}
+    } == {"not_configured", "upstream_error"}
 
 
 async def test_invalid_city_code_returns_safe_error_envelope():
@@ -217,6 +229,60 @@ async def test_connector_status_never_returns_secret_values(monkeypatch):
     assert result["data"]["connectors"]["transaction_prices"]["configured"] is True
     assert result["data"]["connectors"]["current_listings"]["configured"] is True
     assert "do-not-return-this" not in result_text
+
+
+def test_project_links_parser_filters_municipality_land_and_area():
+    content = (
+        "PROPERTY_NUMBER_ID,PROPERTY_CATEGORY,PREFECTURE,CITY,AMOUNT/RENT,"
+        "SIZE_OF_LOT,OCCUPATION_AREA,STRONG_POINTS\n"
+        "1,売買土地,東京都,台東区,30000000,100,,候補A\n"
+        "2,売買居住用,東京都,台東区,50000000,100,80,候補B\n"
+        "3,売買土地,東京都,文京区,40000000,100,,候補C\n"
+        "4,売買土地,東京都,台東区,20000000,200,,候補D\n"
+    ).encode()
+
+    matches = parse_project_links_listings(
+        content, municipality="台東区", target_area_sqm=100
+    )
+
+    assert [item["property_number"] for item in matches] == ["1"]
+    assert matches[0]["land_area_sqm"] == 100
+
+
+async def test_government_open_data_search_returns_compact_official_metadata():
+    ctx = _ctx()
+    response = MagicMock()
+    response.raise_for_status = MagicMock()
+    response.json.return_value = {
+        "success": True,
+        "result": {
+            "count": 1,
+            "results": [
+                {
+                    "name": "sample",
+                    "title": "自治体広報サンプル",
+                    "publisher": "デジタル庁",
+                    "notes": "説明",
+                    "metadata_modified": "2026-08-01T00:00:00",
+                    "landingPage": "https://example.go.jp/data",
+                    "resources": [
+                        {
+                            "name": "CSV",
+                            "format": "CSV",
+                            "url": "https://example.go.jp/data.csv",
+                        }
+                    ],
+                }
+            ],
+        },
+    }
+    ctx.fastmcp._public_http_client.get = AsyncMock(return_value=response)
+
+    result = json.loads(await search_government_open_data("自治体 広報", ctx, 3))
+
+    assert result["status"] == "ok"
+    assert result["data"]["total_matches"] == 1
+    assert result["data"]["datasets"][0]["dataset_id"] == "sample"
 
 
 async def test_plateau_search_filters_official_catalog():

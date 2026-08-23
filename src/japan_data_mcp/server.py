@@ -38,6 +38,12 @@ from japan_data_mcp.public_info.mlit import (
     latlon_to_tile_fraction,
     surrounding_tiles,
 )
+from japan_data_mcp.public_info.project_links import (
+    PROJECT_LINKS_DATA_AS_OF,
+    PROJECT_LINKS_DATASET_URL,
+    PROJECT_LINKS_LISTINGS_CSV_URL,
+    parse_project_links_listings,
+)
 from japan_data_mcp.public_info.real_estate import (
     calculate_price_stats,
     filter_feed_items,
@@ -48,6 +54,7 @@ from japan_data_mcp.realestate.client import RealEstateClient
 from japan_data_mcp.realestate.formatter import format_transactions
 from japan_data_mcp.realestate.models import RealEstateApiError
 from japan_data_mcp.utils.area_codes import (
+    CODE_TO_AREA,
     PREFECTURE_CODES,
     AmbiguousAreaError,
     resolve_area_code,
@@ -55,6 +62,10 @@ from japan_data_mcp.utils.area_codes import (
 from japan_data_mcp.utils.field_codes import STATS_FIELD_CODES, list_stats_fields
 
 logger = logging.getLogger(__name__)
+# HTTPX logs complete redirect URLs.  Project LINKS redirects downloads to a
+# short-lived signed S3 URL, so request-level logging must stay disabled.
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
 
 _JST = timezone(timedelta(hours=9))
 
@@ -74,6 +85,13 @@ _PLATEAU_DATASETS_URL = (
 )
 _REINFOLIB_EXTERNAL_BASE = "https://www.reinfolib.mlit.go.jp/ex-api/external"
 _REINFOLIB_API_MANUAL = "https://www.reinfolib.mlit.go.jp/help/apiManual/"
+_EGOV_DATA_PORTAL_SEARCH_URL = (
+    "https://data.e-gov.go.jp/data/api/action/package_search"
+)
+_PROJECT_LINKS_SOURCE = {
+    "name": "国土交通省 Project LINKS 空き家・空き地バンク登録物件データ",
+    "url": PROJECT_LINKS_DATASET_URL,
+}
 
 _CURATED_TOOL_NAMES = {
     "search_statistics",
@@ -88,6 +106,7 @@ _CURATED_TOOL_NAMES = {
     "research_real_estate_area",
     "get_mlit_geospatial_layers",
     "get_connector_status",
+    "search_government_open_data",
 }
 
 
@@ -197,6 +216,7 @@ mcp = FastMCP(
         "- search_plateau_datasets: PLATEAU公開データセットを検索\n"
         "- get_mlit_geospatial_layers: 地価・都市計画・用途地域等の代表レイヤー\n"
         "- get_connector_status: 接続済み・未接続データ源を確認\n"
+        "- search_government_open_data: e-Govデータポータルで政府公開データを検索\n"
         "- search_invoice_by_name: 会社名からインボイス登録番号を検索"
         "（★インボイス確認はまずこれを使う）\n"
         "- check_invoice_registration: 登録番号（T+13桁）が既知の場合のみ使用\n"
@@ -825,6 +845,7 @@ async def _optional_feed_evidence(
     kind: str,
     area_name: str,
     target_area_sqm: float | None,
+    city_code: str | None,
     ctx: Context,
 ) -> dict[str, Any]:
     """Read an optional licensed listing or spatial-ETL normalized feed."""
@@ -852,6 +873,61 @@ async def _optional_feed_evidence(
             "候補判定であり、所有者・売却意思・建築可能性を保証しません。"
         )
         precision = "candidate"
+
+    if kind == "listing" and not url:
+        normalized_city_code = str(city_code or "").strip()
+        municipality = CODE_TO_AREA.get(normalized_city_code)
+        if municipality is None:
+            return build_evidence_envelope(
+                status="upstream_error",
+                data_as_of=PROJECT_LINKS_DATA_AS_OF,
+                precision="municipality",
+                confidence="not_applicable",
+                sources=[_PROJECT_LINKS_SOURCE],
+                limitations=["市区町村コードから自治体名を解決できませんでした。"],
+                data={item_key: [], "total_matches": 0},
+            )
+        try:
+            response = await _get_public_http_client(ctx).get(
+                PROJECT_LINKS_LISTINGS_CSV_URL,
+                follow_redirects=True,
+            )
+            response.raise_for_status()
+            matches = parse_project_links_listings(
+                response.content,
+                municipality=municipality,
+                land_only=True,
+                target_area_sqm=target_area_sqm,
+            )
+        except (httpx.HTTPError, UnicodeError, ValueError):
+            return build_evidence_envelope(
+                status="upstream_error",
+                data_as_of=PROJECT_LINKS_DATA_AS_OF,
+                precision="municipality",
+                confidence="not_applicable",
+                sources=[_PROJECT_LINKS_SOURCE],
+                limitations=["Project LINKS登録物件CSVの取得または形式検証に失敗しました。"],
+                data={item_key: [], "total_matches": 0},
+            )
+        return build_evidence_envelope(
+            status="ok" if matches else "no_results",
+            data_as_of=PROJECT_LINKS_DATA_AS_OF,
+            precision="municipality",
+            confidence="medium" if matches else "low",
+            sources=[_PROJECT_LINKS_SOURCE],
+            limitations=[
+                "2025年3月31日時点のスナップショットで、現在も掲載中とは限りません。",
+                "町丁目以下の住所は含まれず、市区町村単位の候補です。",
+                "LIFULL提供分のみで、全国版空き家・空き地バンクの全件ではありません。",
+            ],
+            data={
+                item_key: matches[:20],
+                "total_matches": len(matches),
+                "query_municipality": municipality,
+                "requested_area_name": area_name,
+                "snapshot_only": True,
+            },
+        )
 
     if not url:
         return build_evidence_envelope(
@@ -982,8 +1058,15 @@ async def get_connector_status(ctx: Context) -> str:
                         "source": _PLATEAU_SOURCE,
                     },
                     "current_listings": {
-                        "configured": bool(os.environ.get("LISTINGS_JSON_URL")),
-                        "requires": "authorized normalized feed",
+                        "configured": True,
+                        "mode": (
+                            "authorized_normalized_feed"
+                            if os.environ.get("LISTINGS_JSON_URL")
+                            else "official_snapshot_fallback"
+                        ),
+                        "real_time": bool(os.environ.get("LISTINGS_JSON_URL")),
+                        "source": _PROJECT_LINKS_SOURCE,
+                        "requires_for_realtime": "authorized normalized feed",
                     },
                     "vacant_land_candidates": {
                         "configured": bool(
@@ -1068,6 +1151,98 @@ async def search_plateau_datasets(
                 "データセットの存在を示すもので、空き地や売却可否を直接判定しません。"
             ],
             data={"count": len(matches), "datasets": matches[:100]},
+        )
+    )
+
+
+@mcp.tool()
+async def search_government_open_data(
+    query: str,
+    ctx: Context,
+    limit: int = 10,
+) -> str:
+    """e-Govデータポータルで政府機関の公式オープンデータを横断検索する."""
+    safe_limit = max(1, min(limit, 20))
+    try:
+        response = await _get_public_http_client(ctx).get(
+            _EGOV_DATA_PORTAL_SEARCH_URL,
+            params={"q": query, "rows": safe_limit},
+        )
+        response.raise_for_status()
+        payload = response.json()
+        result = payload.get("result", {}) if isinstance(payload, dict) else {}
+        raw_datasets = result.get("results", []) if isinstance(result, dict) else []
+        datasets = []
+        for item in raw_datasets:
+            if not isinstance(item, dict):
+                continue
+            resources = []
+            for resource in item.get("resources", [])[:5]:
+                if not isinstance(resource, dict):
+                    continue
+                resources.append(
+                    {
+                        "name": resource.get("name"),
+                        "format": resource.get("format"),
+                        "url": public_source_url(
+                            resource.get("url"), "https://data.e-gov.go.jp/"
+                        ),
+                        "last_modified": resource.get("last_modified"),
+                    }
+                )
+            datasets.append(
+                {
+                    "dataset_id": item.get("name") or item.get("id"),
+                    "title": item.get("title"),
+                    "publisher": item.get("publisher")
+                    or (item.get("organization") or {}).get("title"),
+                    "description": str(item.get("notes") or "")[:500],
+                    "metadata_modified": item.get("metadata_modified"),
+                    "landing_page": public_source_url(
+                        item.get("landingPage"), "https://data.e-gov.go.jp/"
+                    ),
+                    "resources": resources,
+                }
+            )
+    except (httpx.HTTPError, ValueError, TypeError):
+        return _json_response(
+            build_evidence_envelope(
+                status="upstream_error",
+                data_as_of=None,
+                precision="dataset",
+                confidence="not_applicable",
+                sources=[
+                    {
+                        "name": "e-Govデータポータル メタデータ取得API",
+                        "url": "https://data.e-gov.go.jp/data/api_guide",
+                    }
+                ],
+                limitations=["公式データカタログAPIの取得または形式検証に失敗しました。"],
+                data={"query": query, "datasets": [], "total_matches": 0},
+            )
+        )
+    return _json_response(
+        build_evidence_envelope(
+            status="ok" if datasets else "no_results",
+            data_as_of=None,
+            precision="dataset",
+            confidence="high" if datasets else "low",
+            sources=[
+                {
+                    "name": "e-Govデータポータル メタデータ取得API",
+                    "url": "https://data.e-gov.go.jp/data/api_guide",
+                }
+            ],
+            limitations=[
+                "検索結果はデータセットのメタデータです。数値や本文は各公式リソースを確認してください。",
+                "主に国の行政機関のカタログで、全自治体の広報・オープンデータを網羅しません。",
+            ],
+            data={
+                "query": query,
+                "datasets": datasets,
+                "returned": len(datasets),
+                "total_matches": result.get("count"),
+            },
         )
     )
 
@@ -1303,12 +1478,14 @@ async def research_real_estate_area(
             kind="listing",
             area_name=area_name,
             target_area_sqm=target_area_sqm,
+            city_code=city_code,
             ctx=ctx,
         ),
         _optional_feed_evidence(
             kind="candidate",
             area_name=area_name,
             target_area_sqm=target_area_sqm,
+            city_code=city_code,
             ctx=ctx,
         ),
     )
@@ -1335,6 +1512,8 @@ async def research_real_estate_area(
     unknowns = []
     if listings["status"] == "not_configured":
         unknowns.append("現在売り出されている土地の有無")
+    elif listings["data"].get("snapshot_only"):
+        unknowns.append("2025年3月31日以降の掲載継続状況")
     if candidates["status"] == "not_configured":
         unknowns.append("建物が見当たらない土地候補の有無")
     unknowns.extend(["所有者", "売却意思", "権利関係", "建築可能性"])

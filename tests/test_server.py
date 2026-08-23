@@ -108,6 +108,7 @@ class TestToolRegistration:
             "check_invoice_registration",
             "validate_invoice_on_date",
             "search_invoice_by_name",
+            "search_government_open_data",
         }
         assert expected == tool_names
 

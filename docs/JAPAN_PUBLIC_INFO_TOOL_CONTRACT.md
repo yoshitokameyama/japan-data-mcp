@@ -16,7 +16,7 @@ AIクライアントへ大量の重複toolをそのまま公開せず、用途�
 - **legacy**: 移行期間中だけ互換性のために残すtool。
 
 通常のAI接続では `MCP_TOOL_PROFILE=curated` を使用し、default toolと、
-それらが必要とする統計検索の補助toolだけを含む12 toolsを公開する。
+それらが必要とする統計検索の補助toolに、公式データカタログ検索を加えた13 toolsを公開する。
 `full`は移行・管理用とし、実装を削除せず公開面だけを切り替える。
 
 ## Phase 1 target tools
@@ -31,6 +31,7 @@ AIクライアントへ大量の重複toolをそのまま公開せず、用途�
 | `search_corporations` | default | 国税庁法人番号 | 法人名検索 |
 | `get_corporation` | advanced | 国税庁法人番号 | 法人番号指定 |
 | `search_invoice_by_name` | default | 法人番号・インボイス | 会社名から確認する標準経路 |
+| `search_government_open_data` | default | e-Govデータポータル | 政府機関の公式公開データをメタデータ検索 |
 | `check_invoice_registration` | advanced | インボイス | 登録番号が既知の場合 |
 | `validate_invoice_on_date` | advanced | インボイス | 指定日時点の有効性 |
 | `research_real_estate_area` | default | 国交省＋optional feeds | 土地調査の統合入口 |
@@ -38,7 +39,7 @@ AIクライアントへ大量の重複toolをそのまま公開せず、用途�
 | `get_mlit_geospatial_layers` | advanced | 不動産情報ライブラリ | 既存約30 APIの低水準互換入口 |
 | `search_plateau_datasets` | advanced | PLATEAU catalog | データセットの発見のみ |
 | `get_connector_status` | advanced | service configuration | 利用可能・未接続の監査 |
-| `search_current_listings` | disabled | 利用許諾済み売出feed | 高水準tool内の内部adapter。契約なしでは公開しない |
+| `search_current_listings` | internal | Project LINKS / 利用許諾済み売出feed | 公式スナップショットを既定値とし、契約feed設定時はそちらを優先 |
 | `find_vacant_land_candidates` | disabled | parcel/building/land-use ETL | 高水準tool内の内部adapter。候補であり売出ではない |
 
 ## Existing implementation mapping
@@ -114,5 +115,5 @@ MLITの代表レイヤーは [MLIT_LAYER_MAPPING.md](MLIT_LAYER_MAPPING.md) を�
 - [ ] 既存`get_real_estate_transactions`の代表queryを新toolでも再現できる。
 - [x] 既存`get_multi_api`の代表API番号について、入力と主要fieldを対応表にする。
 - [ ] aliasを残す場合は廃止予定をresponseまたはdocumentationに明記する。
-- [x] AIクライアントのdefault tool一覧は15個前後を上限の目安とする（curated 12 tools）。
+- [x] AIクライアントのdefault tool一覧は15個前後を上限の目安とする（curated 13 tools）。
 - [ ] disabled toolは未設定でも起動を妨げない。
